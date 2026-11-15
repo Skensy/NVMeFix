@@ -121,23 +121,15 @@ bool NVMeFixPlugin::matchingNotificationHandler(void* that, void* , IOService* s
 //		DBGLOG("nvmef", "Parent %s", parent->getName());
 
 		if (parent->metaCast("IONVMeController")) {
-			bool has = false;
-
-			for (size_t i = 0; i < plugin->controllers.size(); i++)
-				if (plugin->controllers[i]->controller == parent) {
-					has = true;
-					break;
-				}
-
-			if (!has) {
+			if (!plugin->entryForController(parent) && !parent->isInactive()) {
 				auto entry = new ControllerEntry(parent);
 				if (!entry) {
 					SYSLOG(Log::Plugin, "Failed to allocate ControllerEntry memory");
 					break;
 				}
-				if (!plugin->controllers.push_back(entry)) {
+				if (!entry->lck || !plugin->controllers.push_back(entry)) {
 					SYSLOG(Log::Plugin, "Failed to insert ControllerEntry memory");
-					ControllerEntry::deleter(entry);
+					delete entry;
 					break;
 				}
 				break;
@@ -158,13 +150,24 @@ bool NVMeFixPlugin::matchingNotificationHandler(void* that, void* , IOService* s
 }
 
 void NVMeFixPlugin::handleControllers() {
-	DBGLOG("nvmef", "handleControllers for %u controllers", controllers.size());
-	for (size_t i = 0; i < controllers.size(); i++) {
-		IOLockLock(controllers[i]->lck);
-		controllers[i]->controller->retain();
-		handleController(*controllers[i]);
-		controllers[i]->controller->release();
-		IOLockUnlock(controllers[i]->lck);
+	for (;;) {
+		ControllerEntry* entry = nullptr;
+		IOLockLock(lck);
+		for (size_t i = 0; i < controllers.size(); ++i) {
+			if (!controllers[i]->processed) {
+				entry = controllers[i];
+				// An unclaimed entry has no PM proxy and is skipped by activityTickle.
+				IOLockLock(entry->lck);
+				entry->processed = true;
+				break;
+			}
+		}
+		IOLockUnlock(lck);
+		if (!entry)
+			return;
+
+		handleController(*entry);
+		IOLockUnlock(entry->lck);
 	}
 }
 
@@ -210,12 +213,6 @@ void NVMeFixPlugin::forceEnableASPM(IOService *device) {
 
 void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	assert(entry.controller);
-
-	if (entry.processed)
-		return;
-
-	/* No error signaling -- just ACK the discovery to notification handler */
-	entry.processed = true;
 
 	uint32_t vendor {};
 	propertyFromParent(entry.controller, "vendor-id", vendor);
@@ -289,7 +286,7 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	/* Get additional quirks based on identify data */
 	entry.quirks |= NVMe::quirksForController(ctrl->vid, ctrl->mn, ctrl->fr);
 
-	entry.controller->setProperty("quirks", OSNumber::withNumber(entry.quirks, 8 * sizeof(entry.quirks)));
+	entry.controller->setProperty("quirks", entry.quirks, 8 * sizeof(entry.quirks));
 
 #ifdef DEBUG
 	char mn[40];
@@ -416,21 +413,37 @@ IOReturn NVMeFixPlugin::NVMeFeatures(ControllerEntry& entry, unsigned fid, unsig
 	return ret;
 }
 
-/* Notifications are serialized for a single controller, so we don't have to sync with removal */
 bool NVMeFixPlugin::terminatedNotificationHandler(void* that, void* , IOService* service,
 												IONotifier* notifier) {
 	auto plugin = static_cast<NVMeFixPlugin*>(that);
 	assert(plugin);
 	assert(service && service->metaCast("IONVMeController"));
 
-	/* Controller retain count should equal 0, so we don't need to hold its lock now */
+	ControllerEntry* entry = nullptr;
 	IOLockLock(plugin->lck);
-	for (size_t i = 0; i < plugin->controllers.size(); i++)
+	for (size_t i = 0; i < plugin->controllers.size(); ++i) {
 		if (plugin->controllers[i]->controller == service) {
+			entry = plugin->controllers[i];
 			plugin->controllers.erase(i);
 			break;
-	   }
+		}
+	}
 	IOLockUnlock(plugin->lck);
+
+	if (entry) {
+		// Drain setup or a tickle that acquired the entry before removal.
+		IOLockLock(entry->lck);
+		entry->removed = true;
+		auto pm = entry->pm;
+		IOLockUnlock(entry->lck);
+		if (pm) {
+			service->deRegisterInterestedDriver(pm);
+			pm->PMstop();
+			pm->release();
+		} else {
+			delete entry;
+		}
+	}
 
 	return false;
 }

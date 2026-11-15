@@ -144,6 +144,12 @@ fail:
 
 OSDefineMetaClassAndStructors(NVMePMProxy, IOService);
 
+void NVMePMProxy::free() {
+	assert(!entry || entry->removed);
+	delete entry;
+	IOService::free();
+}
+
 IOReturn NVMePMProxy::setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice) {
 	DBGLOG(Log::PM, "setPowerState %lu", powerStateOrdinal);
 
@@ -152,10 +158,14 @@ IOReturn NVMePMProxy::setPowerState(unsigned long powerStateOrdinal, IOService *
 
 	auto& plugin = NVMeFixPlugin::globalPlugin();
 
-	unsigned dword11 = ((static_cast<unsigned>(entry->nstates) - 1) -
-						static_cast<unsigned>(powerStateOrdinal)) & 0b1111;
 	/* It's ok to skip active PM */
 	if (IOLockTryLock(entry->lck)) {
+		if (entry->removed) {
+			IOLockUnlock(entry->lck);
+			return kIOPMAckImplied;
+		}
+		unsigned dword11 = ((static_cast<unsigned>(entry->nstates) - 1) -
+							static_cast<unsigned>(powerStateOrdinal)) & 0b1111;
 		uint32_t res {};
 		auto ret = plugin.NVMeFeatures(*entry, NVMe::NVME_FEAT_POWER_MGMT, nullptr, nullptr, &res,
 			false);
@@ -201,7 +211,7 @@ IOReturn NVMePMProxy::powerStateDidChangeTo(IOPMPowerFlags capabilities, unsigne
 	IOLockLock(entry->lck);
 	NVMe::nvme_id_ctrl* identify {};
 
-	if (entry->controller != whatDevice) {
+	if (entry->removed || entry->controller != whatDevice) {
 		DBGLOG(Log::PM, "Power state change for irrelevant device %s",
 			   whatDevice->getMetaClass()->getClassName());
 		goto done;
@@ -246,11 +256,13 @@ bool NVMeFixPlugin::PM::activityTickle(void* controller, unsigned long type, uns
 	ControllerEntry* entry {nullptr};
 	IOLockLock(plugin.lck);
 	entry = plugin.entryForController(static_cast<IOService*>(controller));
+	if (entry && (!entry->processed || !IOLockTryLock(entry->lck)))
+		entry = nullptr;
 	IOLockUnlock(plugin.lck);
 	
 	/* If APST is enabled, we do not manage NVMe PM ourselves. */
 	/* We cannot avoid hooking activityTickle, however, as don't know if we have APST in advance */
-	if (entry && IOLockTryLock(entry->lck)) {
+	if (entry) {
 		if (!entry->apste && entry->powerStates && entry->pm) {
 //			DBGLOG("pm", "activityTickle");
 			entry->pm->activityTickle(kIOPMSuperclassPolicy1, entry->nstates - 1);

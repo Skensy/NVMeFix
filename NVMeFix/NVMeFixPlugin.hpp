@@ -238,7 +238,8 @@ private:
 
 	struct ControllerEntry {
 		IOService* controller {nullptr};
-		bool processed {false};
+		bool processed {false}; // Protected by the registry lock.
+		bool removed {false}; // Protected by the entry lock.
 		NVMe::nvme_quirks quirks {NVMe::NVME_QUIRK_NONE};
 		uint64_t ps_max_latency_us {100000};
 		IOPMPowerState* powerStates {nullptr};
@@ -252,33 +253,22 @@ private:
 			return !(quirks & NVMe::nvme_quirks::NVME_QUIRK_NO_APST) && ps_max_latency_us > 0;
 		}
 
-		static void deleter(ControllerEntry* entry) {
-			assert(entry);
-
-			/* PM functions don't check for validity of entry or its members, so let's stop it early */
-			if (entry->pm) {
-				if (entry->controller)
-					entry->controller->deRegisterInterestedDriver(entry->pm);
-				entry->pm->PMstop();
-				entry->pm->release();
-			}
-			if (entry->powerStates)
-				delete[] entry->powerStates;
-			if (entry->identify)
-				entry->identify->release();
-			if (entry->lck)
-				IOLockFree(entry->lck);
-
-			delete entry;
+		explicit ControllerEntry(IOService* c) : controller(c), lck(IOLockAlloc()) {
+			controller->retain();
 		}
 
-		explicit ControllerEntry(IOService* c) : controller(c) {
-			lck = IOLockAlloc();
-			assert(lck);
+		~ControllerEntry() {
+			if (powerStates)
+				delete[] powerStates;
+			if (identify)
+				identify->release();
+			if (lck)
+				IOLockFree(lck);
+			controller->release();
 		}
 	};
 
-	evector<ControllerEntry*, ControllerEntry::deleter> controllers;
+	evector<ControllerEntry*> controllers;
 	void handleControllers();
 	void forceEnableASPM(IOService*);
 	void handleController(ControllerEntry&);
@@ -325,7 +315,9 @@ public:
 		unsigned long   stateNumber,
 		IOService *     whatDevice ) override;
 
+	// A successfully initialized proxy owns the entry until its final IOKit callback returns.
 	NVMeFixPlugin::ControllerEntry* entry {nullptr};
+	void free() override;
 };
 
 #endif /* NVMeFixPlugin_h */
