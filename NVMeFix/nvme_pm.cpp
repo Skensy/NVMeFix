@@ -35,12 +35,16 @@
 * touch the internal state of IONVMe.
 */
 bool NVMeFixPlugin::PM::init(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl, bool apst) {
-	entry.pm = new NVMePMProxy();
-	if (entry.pm && !entry.pm->init()) {
+	auto proxy = new NVMePMProxy();
+	if (!proxy)
+		return false;
+	if (!proxy->init()) {
 		DBGLOG(Log::PM, "Failed to init IOService");
+		proxy->release();
 		return false;
 	}
-	static_cast<NVMePMProxy*>(entry.pm)->entry = &entry;
+	proxy->entry = &entry;
+	entry.pm = proxy;
 
 	// If we did not manage to enable APST, assume we can't reenable it next
 	if (apst) {
@@ -69,6 +73,7 @@ bool NVMeFixPlugin::PM::initActivePM(ControllerEntry& entry, const NVMe::nvme_id
 		if (!(ctrl->psd[state].flags & NVMe::NVME_PS_FLAGS_NON_OP_STATE))
 			op++;
 
+	entry.nstates = op + 1; // IOPM state zero precedes the operational states.
 	entry.powerStates = new IOPMPowerState[entry.nstates];
 	if (!entry.powerStates) {
 		SYSLOG(Log::PM, "Failed to allocate power state buffer");
@@ -109,6 +114,7 @@ bool NVMeFixPlugin::PM::initActivePM(ControllerEntry& entry, const NVMe::nvme_id
 		idx++;
 	}
 
+	assert(idx == entry.nstates);
 	DBGLOG(Log::PM, "Publishing %u states", entry.nstates);
 	
 	auto status = entry.pm->registerPowerDriver(entry.pm, entry.powerStates, entry.nstates);

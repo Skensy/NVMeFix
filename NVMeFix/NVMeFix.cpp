@@ -281,6 +281,10 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	}
 
 	entry.identify = identifyDesc;
+	if (ctrl->npss >= arrsize(ctrl->psd)) {
+		SYSLOG(Log::Plugin, "Invalid NPSS");
+		return;
+	}
 
 	/* Get additional quirks based on identify data */
 	entry.quirks |= NVMe::quirksForController(ctrl->vid, ctrl->mn, ctrl->fr);

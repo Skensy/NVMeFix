@@ -59,12 +59,7 @@ IOReturn NVMeFixPlugin::configureAPST(ControllerEntry& entry, const NVMe::nvme_i
 		SYSLOG(Log::APST, "APST unsupported by this controller");
 		return kIOReturnUnsupported;
 	}
-	if (ctrl->npss > 31) {
-		SYSLOG(Log::APST, "Invalid NPSS");
-		return kIOReturnUnsupported;
-	}
-
-	auto ret = kIOReturnSuccess;
+	IOReturn ret = kIOReturnUnsupported;
 	auto apstDesc = IOBufferMemoryDescriptor::withCapacity(sizeof(NVMe::nvme_feat_auto_pst),
 														   kIODirectionOut);
 
@@ -136,8 +131,10 @@ IOReturn NVMeFixPlugin::configureAPST(ControllerEntry& entry, const NVMe::nvme_i
 		else
 			DBGLOG(Log::APST, "APST enabled: max PS = %d, max round-trip latency = %lluus\n",
 				max_ps, max_lat_us);
-	} else
+	} else {
 		SYSLOG(Log::APST, "Failed to get table buffer");
+		ret = kIOReturnNoResources;
+	}
 
 	if (max_ps != -1) {
 		uint32_t dword11 {1};
@@ -156,7 +153,7 @@ IOReturn NVMeFixPlugin::APSTenabled(ControllerEntry& entry, bool& enabled) {
 	if (ret != kIOReturnSuccess)
 		DBGLOG(Log::APST, "Failed to get features");
 	else
-		enabled = res;
+		enabled = (res & 1) != 0;
 	return ret;
 }
 
