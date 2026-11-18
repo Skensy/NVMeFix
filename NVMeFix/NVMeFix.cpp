@@ -180,8 +180,13 @@ void NVMeFixPlugin::handleControllers() {
 }
 
 void NVMeFixPlugin::forceEnableASPM(IOService *controller) {
-	auto ssd = OSDynamicCast(IOPCIDevice, controller->getParentEntry(gIOServicePlane));
-	auto bridge = ssd ? OSDynamicCast(IOPCIDevice, ssd->getParentEntry(gIODTPlane)) : nullptr;
+	// Use virtual PCI accessors so OpenCore can link without direct IOPCIFamily imports.
+	auto pciParent = [](IORegistryEntry *entry, const IORegistryPlane *plane) {
+		auto parent = entry->getParentEntry(plane);
+		return parent ? static_cast<IOPCIDevice *>(parent->metaCast("IOPCIDevice")) : nullptr;
+	};
+	auto ssd = pciParent(controller, gIOServicePlane);
+	auto bridge = ssd ? pciParent(ssd, gIODTPlane) : nullptr;
 	if (!bridge)
 		return;
 
@@ -192,20 +197,26 @@ void NVMeFixPlugin::forceEnableASPM(IOService *controller) {
 		auto pci = partners[i];
 		if (!pci->findPCICapability(kIOPCICapabilityIDPCIExpress, &offsets[i]))
 			return;
-		auto capabilities = pci->configRead32(offsets[i] + 0x0C);
+		if (offsets[i] > 0xEC)
+			return;
+		auto space = pci->space;
+		space.es.registerNumExtended = 0;
+		auto capabilities = pci->configRead32(space, offsets[i] + 0x0C);
 		if (capabilities == UINT32_MAX || !(capabilities & (1U << 11)))
 			return;
 	}
 
 	for (size_t i = 0; i < arrsize(partners); ++i) {
 		auto pci = partners[i];
-		auto offset = offsets[i] + 0x10;
-		auto control = pci->configRead16(offset);
+		auto space = pci->space;
+		space.es.registerNumExtended = 0;
+		UInt8 offset = offsets[i] + 0x10;
+		auto control = pci->configRead16(space, offset);
 		if (control == UINT16_MAX)
 			return;
 		if (!(control & ASPM_L1EntryEnabled))
-			pci->configWrite16(offset, control | ASPM_L1EntryEnabled);
-		control = pci->configRead16(offset);
+			pci->configWrite16(space, offset, control | ASPM_L1EntryEnabled);
+		control = pci->configRead16(space, offset);
 		if (control == UINT16_MAX || !(control & ASPM_L1EntryEnabled))
 			return;
 		pci->setProperty("pci-aspm-custom", control, 32);
