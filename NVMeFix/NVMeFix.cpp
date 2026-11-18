@@ -121,7 +121,15 @@ bool NVMeFixPlugin::matchingNotificationHandler(void* that, void* , IOService* s
 //		DBGLOG("nvmef", "Parent %s", parent->getName());
 
 		if (parent->metaCast("IONVMeController")) {
-			if (!plugin->entryForController(parent) && !parent->isInactive()) {
+			auto existing = plugin->entryForController(parent);
+			if (existing && !parent->isInactive() && IOLockTryLock(existing->lck)) {
+				if (existing->retryIdentify) {
+					existing->retryIdentify = false;
+					existing->processed = false;
+				}
+				IOLockUnlock(existing->lck);
+			}
+			if (!existing && !parent->isInactive()) {
 				auto entry = new ControllerEntry(parent);
 				if (!entry) {
 					SYSLOG(Log::Plugin, "Failed to allocate ControllerEntry memory");
@@ -171,44 +179,37 @@ void NVMeFixPlugin::handleControllers() {
 	}
 }
 
-void NVMeFixPlugin::forceEnableASPM(IOService *device) {
-	IOPCIDevice *pci = static_cast<IOPCIDevice *>(device->metaCast("IOPCIDevice"));
-	if (!pci) return;
-
-	uint32_t aspm = 0;
-	auto prop = device->getProperty("pci-aspm-default");
-	if (prop) {
-		auto num = OSDynamicCast(OSNumber, prop);
-		if (num != nullptr) {
-			aspm = num->unsigned32BitValue();
-		} else {
-			auto data = OSDynamicCast(OSData, prop);
-			if (data != nullptr && data->getLength() == sizeof(aspm))
-				lilu_os_memcpy(&aspm, data->getBytesNoCopy(), sizeof(aspm));
-		}
-	}
-
-	DBGLOG(Log::Plugin, "Activating ASPM on %s, currently %X", safeString(device->getName()), aspm);
-
-	// Do not repeat what is already done.
-	if ((aspm & ASPM_Mask) == ASPM_L1EntryEnabled) return;
-
-	UInt8 offset = 0;
-	if (!pci->findPCICapability(kIOPCICapabilityIDPCIExpress, &offset)) {
-		SYSLOG(Log::Plugin, "NO PCIe capability support on %s", safeString(device->getName()));
+void NVMeFixPlugin::forceEnableASPM(IOService *controller) {
+	auto ssd = OSDynamicCast(IOPCIDevice, controller->getParentEntry(gIOServicePlane));
+	auto bridge = ssd ? OSDynamicCast(IOPCIDevice, ssd->getParentEntry(gIODTPlane)) : nullptr;
+	if (!bridge)
 		return;
+
+	// Both partners must support L1. Enable the upstream end first.
+	IOPCIDevice *partners[] {bridge, ssd};
+	UInt8 offsets[2] {};
+	for (size_t i = 0; i < arrsize(partners); ++i) {
+		auto pci = partners[i];
+		if (!pci->findPCICapability(kIOPCICapabilityIDPCIExpress, &offsets[i]))
+			return;
+		auto capabilities = pci->configRead32(offsets[i] + 0x0C);
+		if (capabilities == UINT32_MAX || !(capabilities & (1U << 11)))
+			return;
 	}
 
-	offset += 0x10; // link control offset.
-
-	IOPCIAddressSpace space = pci->space;
-	space.es.registerNumExtended = 0;
-
-	auto linkControl = pci->configRead16(space, offset);
-	pci->configWrite16(space, offset, (linkControl & ~ASPM_Mask) | ASPM_L1EntryEnabled);
-	auto newLinkControl = pci->configRead16(space, offset);
-	DBGLOG(Log::Plugin, "ASPM transition on %s from %X to %X", safeString(device->getName()), linkControl, newLinkControl);
-	pci->setProperty("pci-aspm-custom", newLinkControl, 32);
+	for (size_t i = 0; i < arrsize(partners); ++i) {
+		auto pci = partners[i];
+		auto offset = offsets[i] + 0x10;
+		auto control = pci->configRead16(offset);
+		if (control == UINT16_MAX)
+			return;
+		if (!(control & ASPM_L1EntryEnabled))
+			pci->configWrite16(offset, control | ASPM_L1EntryEnabled);
+		control = pci->configRead16(offset);
+		if (control == UINT16_MAX || !(control & ASPM_L1EntryEnabled))
+			return;
+		pci->setProperty("pci-aspm-custom", control, 32);
+	}
 }
 
 void NVMeFixPlugin::handleController(ControllerEntry& entry) {
@@ -224,15 +225,8 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	/**
 	 * Force enable ASPM when the user cannot provide device properties.
 	 */
-	if (checkKernelArgument("-nvmefaspm")) {
-		auto ssd = OSDynamicCast(IOService, entry.controller->getParentEntry(gIOServicePlane));
-		if (ssd) {
-			forceEnableASPM(ssd);
-			auto bridge = OSDynamicCast(IOService, ssd->getParentEntry(gIODTPlane));
-			if (bridge)
-				forceEnableASPM(bridge);
-		}
-	}
+	if (checkKernelArgument("-nvmefaspm"))
+		forceEnableASPM(entry.controller);
 
 	/**
 	 * Force enable ANS2MSIWorkaround.
@@ -265,6 +259,7 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	IOBufferMemoryDescriptor* identifyDesc {nullptr};
 
 	if (identify(entry, identifyDesc) != kIOReturnSuccess || !identifyDesc) {
+		entry.retryIdentify = true;
 		SYSLOG(Log::Plugin, "Failed to identify controller");
 		return;
 	}
@@ -296,10 +291,10 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	DBGLOG(Log::Plugin, "Identified model %s (vid 0x%x)", mn, ctrl->vid);
 #endif
 
-	if (!enableAPST(entry, ctrl))
+	if (!enableAPST(entry, ctrl) && entry.apstAllowed())
 		SYSLOG(Log::APST, "Failed to enable APST");
 
-	if (!PM.init(entry, ctrl, entry.apste))
+	if (!PM.init(entry, ctrl, entry.apste && entry.apstAllowed()))
 		SYSLOG(Log::PM, "Failed to initialise power management");
 }
 
@@ -317,6 +312,10 @@ IOReturn NVMeFixPlugin::identify(ControllerEntry& entry, IOBufferMemoryDescripto
 		goto fail;
 	}
 	data = static_cast<uint8_t*>(desc->getBytesNoCopy());
+	if (!data) {
+		ret = kIOReturnNoResources;
+		goto fail;
+	}
 	memset(data, '\0', desc->getLength());
 
 	ret = desc->prepare();
@@ -338,8 +337,10 @@ IOReturn NVMeFixPlugin::identify(ControllerEntry& entry, IOBufferMemoryDescripto
 fail:
 	if (prepared)
 		desc->complete();
-	if (ret != kIOReturnSuccess && desc)
+	if (ret != kIOReturnSuccess && desc) {
 		desc->release();
+		desc = nullptr;
+	}
 	return ret;
 }
 
@@ -365,9 +366,10 @@ IOReturn NVMeFixPlugin::NVMeFeatures(ControllerEntry& entry, unsigned fid, unsig
 			DBGLOG(Log::Feature, "IONVMeController::GetRequest failed");
 			ret = kIOReturnNoResources;
 		} else if (desc)
-			ret = reinterpret_cast<IODMACommand*>(req)->setMemoryDescriptor(desc);
+			ret = reinterpret_cast<IODMACommand*>(req)->setMemoryDescriptor(desc, false);
 
 		if (ret == kIOReturnSuccess) {
+			bool dmaPrepared = false;
 			if (set)
 				kextFuncs.AppleNVMeRequest.BuildCommandSetFeaturesCommon(req, fid);
 			else
@@ -378,6 +380,7 @@ IOReturn NVMeFixPlugin::NVMeFeatures(ControllerEntry& entry, unsigned fid, unsig
 			if (desc) {
 				kextMembers.AppleNVMeRequest.prpDescriptor.get(req) = desc;
 				ret = reinterpret_cast<IODMACommand*>(req)->prepare(0, desc->getLength());
+				dmaPrepared = ret == kIOReturnSuccess;
 			}
 
 			if (ret != kIOReturnSuccess)
@@ -400,10 +403,11 @@ IOReturn NVMeFixPlugin::NVMeFeatures(ControllerEntry& entry, unsigned fid, unsig
 						*res = kextMembers.AppleNVMeRequest.result.get(req);
 				}
 			}
-			if (desc)
+			if (dmaPrepared)
 				reinterpret_cast<IODMACommand*>(req)->complete();
-			kextFuncs.IONVMeController.ReturnRequest(entry.controller, req);
 		}
+		if (req)
+			kextFuncs.IONVMeController.ReturnRequest(entry.controller, req);
 	} else
 		SYSLOG(Log::Feature, "Failed to prepare buffer");
 
@@ -492,12 +496,15 @@ void NVMeFixPlugin::init() {
 
 	return;
 fail:
-	if (lck)
-		IOLockFree(lck);
 	if (matchingNotifier)
 		matchingNotifier->remove();
 	if (terminationNotifier)
 		terminationNotifier->remove();
+	for (size_t i = 0; i < controllers.size(); ++i)
+		delete controllers[i];
+	controllers.deinit();
+	if (lck)
+		IOLockFree(lck);
 }
 
 void NVMeFixPlugin::deinit() {

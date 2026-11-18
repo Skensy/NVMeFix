@@ -239,11 +239,13 @@ private:
 	struct ControllerEntry {
 		IOService* controller {nullptr};
 		bool processed {false}; // Protected by the registry lock.
+		bool retryIdentify {false}; // Retry on the next matching media notification.
 		bool removed {false}; // Protected by the entry lock.
 		NVMe::nvme_quirks quirks {NVMe::NVME_QUIRK_NONE};
 		uint64_t ps_max_latency_us {100000};
 		IOPMPowerState* powerStates {nullptr};
 		size_t nstates {0};
+		uint8_t operationalPS[32] {}; // Indexed by nonzero IOKit ordinal minus one.
 		IOLock* lck {nullptr};
 		IOService* pm {nullptr};
 		IOBufferMemoryDescriptor* identify {nullptr};

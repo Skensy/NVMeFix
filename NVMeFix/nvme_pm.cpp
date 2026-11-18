@@ -46,8 +46,7 @@ bool NVMeFixPlugin::PM::init(ControllerEntry& entry, const NVMe::nvme_id_ctrl* c
 	proxy->entry = &entry;
 	entry.pm = proxy;
 
-	// If we did not manage to enable APST, assume we can't reenable it next
-	if (apst) {
+	if (apst || ((ctrl->apsta & 1) && !entry.apstAllowed())) {
 		DBGLOG(Log::PM, "Registering power change interest");
 		entry.controller->registerInterestedDriver(entry.pm);
 		entry.nstates = 0;
@@ -98,6 +97,7 @@ bool NVMeFixPlugin::PM::initActivePM(ControllerEntry& entry, const NVMe::nvme_id
 		if (ctrl->psd[state].flags & NVMe::NVME_PS_FLAGS_NON_OP_STATE)
 			continue;
 
+		entry.operationalPS[idx - 1] = static_cast<uint8_t>(state);
 		auto& ps = entry.powerStates[idx];
 		ps = {kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 		/**
@@ -160,22 +160,22 @@ IOReturn NVMePMProxy::setPowerState(unsigned long powerStateOrdinal, IOService *
 
 	/* It's ok to skip active PM */
 	if (IOLockTryLock(entry->lck)) {
-		if (entry->removed) {
+		if (entry->removed || !entry->powerStates || powerStateOrdinal >= entry->nstates) {
 			IOLockUnlock(entry->lck);
 			return kIOPMAckImplied;
 		}
-		unsigned dword11 = ((static_cast<unsigned>(entry->nstates) - 1) -
-							static_cast<unsigned>(powerStateOrdinal)) & 0b1111;
+		unsigned dword11 = entry->operationalPS[powerStateOrdinal - 1];
+		auto ctrl = static_cast<const NVMe::nvme_id_ctrl*>(entry->identify->getBytesNoCopy());
 		uint32_t res {};
 		auto ret = plugin.NVMeFeatures(*entry, NVMe::NVME_FEAT_POWER_MGMT, nullptr, nullptr, &res,
 			false);
-		res &= 0b1111;
+		res &= 0x1F;
 
 		DBGLOG(Log::PM, "Current ps 0x%x, proposed 0x%x", res, dword11);
 
 		if (ret != kIOReturnSuccess) {
 			SYSLOG(Log::PM, "Failed to get power state");
-		} else if (res < entry->nstates - 1) { /* Only transition to op state if we're not in nop state due to APST */
+		} else if (ctrl && res <= ctrl->npss && !(ctrl->psd[res].flags & NVMe::NVME_PS_FLAGS_NON_OP_STATE)) {
 			DBGLOG(Log::PM, "Setting power state 0x%x", dword11);
 
 			ret = plugin.NVMeFeatures(*entry, NVMe::NVME_FEAT_POWER_MGMT, &dword11, nullptr, nullptr,
@@ -217,23 +217,13 @@ IOReturn NVMePMProxy::powerStateDidChangeTo(IOPMPowerFlags capabilities, unsigne
 		goto done;
 	}
 
-	if (!entry->apstAllowed()) {
-		DBGLOG(Log::PM, "APST not allowed");
-		goto done;
-	}
-
-	if (!entry->apste) {
-		DBGLOG(Log::PM, "APST not enabled yet; not re-enabling");
-		goto done;
-	}
-
 	assert(entry->identify);
 	identify = static_cast<decltype(identify)>(entry->identify->getBytesNoCopy());
 	if (!identify) {
 		DBGLOG(Log::PM, "Failed to get identify bytes");
 		goto done;
-	} else if (!plugin.enableAPST(*entry, identify))
-		DBGLOG(Log::PM, "Failed to re-enable APST");
+	} else
+		plugin.enableAPST(*entry, identify);
 
 done:
 	IOLockUnlock(entry->lck);

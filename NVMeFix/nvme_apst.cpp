@@ -22,30 +22,22 @@
 #include "NVMeFixPlugin.hpp"
 
 bool NVMeFixPlugin::enableAPST(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl) {
-#ifdef DEBUG
-	if (APSTenabled(entry, entry.apste) == kIOReturnSuccess)
-		DBGLOG(Log::APST, "APST status %d", entry.apste);
-#endif
-
-	if (entry.apstAllowed()) {
-		DBGLOG("apst", "Configuring APST");
-		auto res = configureAPST(entry, ctrl);
-		if (res != kIOReturnSuccess) {
-			DBGLOG("nvmef", "Failed to configure APST with 0x%x", res);
-			entry.apste = false;
-		} else /* Assume we turn APST on without double checking in RELEASE builds */
-			entry.apste = true;
-	} else
-		DBGLOG(Log::APST, "Not configuring APST (it is already enabled or quirks prohibit it)");
-
-#ifdef DEBUG
-	if (APSTenabled(entry, entry.apste) == kIOReturnSuccess) {
-		DBGLOG(Log::APST, "APST status %d", entry.apste);
+	const bool allowed = entry.apstAllowed();
+	auto status = configureAPST(entry, ctrl);
+	entry.apste = allowed && status == kIOReturnSuccess;
+	if (status != kIOReturnSuccess && !allowed && (ctrl->apsta & 1)) {
+		SYSLOG(Log::APST, "Failed to disable APST with 0x%x", status);
+		if (APSTenabled(entry, entry.apste) != kIOReturnSuccess) {
+			entry.controller->removeProperty("apst");
+			return false;
+		}
 	}
+#ifdef DEBUG
+	if (ctrl->apsta & 1)
+		APSTenabled(entry, entry.apste);
 	if (entry.apste && dumpAPST(entry, ctrl->npss))
 		DBGLOG(Log::APST, "Failed to dump APST table");
 #endif
-
 	entry.controller->setProperty("apst", entry.apste);
 	return entry.apste;
 }
@@ -55,7 +47,7 @@ IOReturn NVMeFixPlugin::configureAPST(ControllerEntry& entry, const NVMe::nvme_i
 	assert(ctrl);
 	assert(entry.controller);
 
-	if (!ctrl->apsta) {
+	if (!(ctrl->apsta & 1)) {
 		SYSLOG(Log::APST, "APST unsupported by this controller");
 		return kIOReturnUnsupported;
 	}
@@ -73,6 +65,12 @@ IOReturn NVMeFixPlugin::configureAPST(ControllerEntry& entry, const NVMe::nvme_i
 
 	if (apstTable) {
 		memset(apstTable, '\0', sizeof(*apstTable));
+		if (!entry.apstAllowed()) {
+			uint32_t disabled = 0;
+			ret = NVMeFeatures(entry, NVMe::NVME_FEAT_AUTO_PST, &disabled, apstDesc, nullptr, true);
+			apstDesc->release();
+			return ret;
+		}
 
 		uint64_t target {0};
 		uint64_t max_lat_us {0};
@@ -148,7 +146,11 @@ IOReturn NVMeFixPlugin::configureAPST(ControllerEntry& entry, const NVMe::nvme_i
 
 IOReturn NVMeFixPlugin::APSTenabled(ControllerEntry& entry, bool& enabled) {
 	uint32_t res {};
-	auto ret = NVMeFeatures(entry, NVMe::NVME_FEAT_AUTO_PST, nullptr, nullptr, &res, false);
+	auto table = IOBufferMemoryDescriptor::withCapacity(sizeof(NVMe::nvme_feat_auto_pst), kIODirectionIn);
+	if (!table)
+		return kIOReturnNoResources;
+	auto ret = NVMeFeatures(entry, NVMe::NVME_FEAT_AUTO_PST, nullptr, table, &res, false);
+	table->release();
 
 	if (ret != kIOReturnSuccess)
 		DBGLOG(Log::APST, "Failed to get features");
@@ -160,7 +162,7 @@ IOReturn NVMeFixPlugin::APSTenabled(ControllerEntry& entry, bool& enabled) {
 IOReturn NVMeFixPlugin::dumpAPST(ControllerEntry& entry, int npss) {
 	assert(entry.controller);
 
-	auto ret = kIOReturnSuccess;
+	IOReturn ret = kIOReturnSuccess;
 	auto apstDesc = IOBufferMemoryDescriptor::withCapacity(sizeof(NVMe::nvme_feat_auto_pst),
 														   kIODirectionIn);
 	if (!apstDesc) {
@@ -169,10 +171,14 @@ IOReturn NVMeFixPlugin::dumpAPST(ControllerEntry& entry, int npss) {
 	}
 
 	auto apstTable = static_cast<NVMe::nvme_feat_auto_pst*>(apstDesc->getBytesNoCopy());
+	if (!apstTable) {
+		apstDesc->release();
+		return kIOReturnNoResources;
+	}
 	memset(apstTable, '\0', apstDesc->getLength());
 
-	if (NVMeFeatures(entry, NVMe::NVME_FEAT_AUTO_PST, nullptr, apstDesc, nullptr, false) !=
-		kIOReturnSuccess) {
+	ret = NVMeFeatures(entry, NVMe::NVME_FEAT_AUTO_PST, nullptr, apstDesc, nullptr, false);
+	if (ret != kIOReturnSuccess) {
 		DBGLOG(Log::APST, "Failed to get features");
 		goto fail;
 	}
