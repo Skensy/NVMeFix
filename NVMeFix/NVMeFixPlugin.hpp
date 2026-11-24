@@ -236,6 +236,8 @@ private:
 	 */
 	static constexpr int controllerSearchDepth {20};
 
+	enum class APSTState { Unknown, Disabled, Enabled };
+
 	struct ControllerEntry {
 		IOService* controller {nullptr};
 		bool processed {false}; // Protected by the registry lock.
@@ -249,7 +251,8 @@ private:
 		IOLock* lck {nullptr};
 		IOService* pm {nullptr};
 		IOBufferMemoryDescriptor* identify {nullptr};
-		bool apste {false};
+		bool activePM {false}; // Protected by the entry lock, as is the last manual power setting.
+		bool restorePS0 {false};
 
 		bool apstAllowed() {
 			return !(quirks & NVMe::nvme_quirks::NVME_QUIRK_NO_APST) && ps_max_latency_us > 0;
@@ -271,24 +274,22 @@ private:
 	};
 
 	evector<ControllerEntry*> controllers;
+	atomic_uint activePMControllers = 0;
+	void setActivePM(ControllerEntry&, bool);
 	void handleControllers();
 	void forceEnableASPM(IOService*);
 	void handleController(ControllerEntry&);
 	IOReturn identify(ControllerEntry&,IOBufferMemoryDescriptor*&);
-	bool enableAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*);
-	IOReturn configureAPST(ControllerEntry&,const NVMe::nvme_id_ctrl*);
+	APSTState applyAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*);
+	IOReturn configureAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*, bool& enabled);
 	IOReturn APSTenabled(ControllerEntry&, bool&);
 	IOReturn dumpAPST(ControllerEntry&, int npss);
 	IOReturn NVMeFeatures(ControllerEntry&, unsigned fid, unsigned* dword11, IOBufferMemoryDescriptor* desc,
 							 uint32_t* res, bool set);
 	ControllerEntry* entryForController(IOService*) const;
 	struct PM {
-		/**
-		 * If `apst`, initialises and enables NVMePMProxy to handle controller power state change
-		 * events in order to re-enable APST after reset.
-		 * If `!apst`, active NVMe PM is configured.
-		 */
-		bool init(ControllerEntry&,const NVMe::nvme_id_ctrl*,bool apst);
+		bool init(ControllerEntry&, const NVMe::nvme_id_ctrl*, APSTState);
+		bool updatePolicy(ControllerEntry&, const NVMe::nvme_id_ctrl*, APSTState);
 		bool solveSymbols(KernelPatcher&);
 
 		static constexpr unsigned idlePeriod {2}; /* seconds */
@@ -299,7 +300,7 @@ private:
 	private:
 		NVMeFixPlugin& plugin;
 		
-		bool initActivePM(ControllerEntry&, const NVMe::nvme_id_ctrl*);
+		bool registerPowerStates(ControllerEntry&, const NVMe::nvme_id_ctrl*);
 	} PM;
 };
 

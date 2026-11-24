@@ -13,7 +13,6 @@
 // WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 
 #include <IOKit/IOService.h>
-#include <IOKit/IOService.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <kern/assert.h>
 
@@ -34,7 +33,7 @@
 * As we never transition to idle states, we need not freeze the command queue, so we don't have to
 * touch the internal state of IONVMe.
 */
-bool NVMeFixPlugin::PM::init(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl, bool apst) {
+bool NVMeFixPlugin::PM::init(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl, APSTState state) {
 	auto proxy = new NVMePMProxy();
 	if (!proxy)
 		return false;
@@ -46,26 +45,64 @@ bool NVMeFixPlugin::PM::init(ControllerEntry& entry, const NVMe::nvme_id_ctrl* c
 	proxy->entry = &entry;
 	entry.pm = proxy;
 
-	if (apst || ((ctrl->apsta & 1) && !entry.apstAllowed())) {
-		DBGLOG(Log::PM, "Registering power change interest");
-		entry.controller->registerInterestedDriver(entry.pm);
-		entry.nstates = 0;
-		entry.powerStates = nullptr;
-	}
-
 	entry.pm->PMinit();
 	auto root = IOService::getPMRootDomain();
 	if (root)
 		reinterpret_cast<IOService*>(root)->joinPMtree(entry.pm);
 	assert(root);
-	
-	if (!apst)
-		return initActivePM(entry, ctrl);
-	
-	return true;
+
+	// A failed Set Features at boot still needs a retry when the controller wakes.
+	if (ctrl->apsta & 1)
+		entry.controller->registerInterestedDriver(entry.pm);
+
+	return updatePolicy(entry, ctrl, state);
 }
 
-bool NVMeFixPlugin::PM::initActivePM(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl) {
+// The caller holds the entry lock. The count is only a fast negative lookup:
+// the registry and entry locks still protect lifetimes on the slow path.
+void NVMeFixPlugin::setActivePM(ControllerEntry& entry, bool active) {
+	if (entry.activePM == active)
+		return;
+	entry.activePM = active;
+	if (active)
+		atomic_fetch_add_explicit(&activePMControllers, 1, memory_order_release);
+	else
+		atomic_fetch_sub_explicit(&activePMControllers, 1, memory_order_release);
+}
+
+bool NVMeFixPlugin::PM::updatePolicy(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl, APSTState state) {
+	bool ok = true;
+	if (state == APSTState::Disabled) {
+		if (entry.activePM)
+			return true;
+		if (!entry.powerStates && !registerPowerStates(entry, ctrl))
+			return false;
+		if (entry.pm->makeUsable() == kIOReturnSuccess &&
+			entry.pm->changePowerStateTo(1) == kIOReturnSuccess &&
+			entry.pm->setIdleTimerPeriod(idlePeriod) == kIOReturnSuccess) {
+			plugin.setActivePM(entry, true);
+			return true;
+		}
+		ok = false; // Release any IOKit requests accepted before the failure.
+	}
+
+	plugin.setActivePM(entry, false);
+	if (entry.powerStates) {
+		// Drop the timer and both IOKit power requests left by the manual policy.
+		ok &= entry.pm->setIdleTimerPeriod(0) == kIOReturnSuccess;
+		ok &= entry.pm->changePowerStateTo(0) == kIOReturnSuccess;
+		ok &= entry.pm->changePowerStateToPriv(0) == kIOReturnSuccess;
+	}
+	if (state == APSTState::Enabled && entry.restorePS0) {
+		unsigned ps = 0;
+		if (plugin.NVMeFeatures(entry, NVMe::NVME_FEAT_POWER_MGMT, &ps, nullptr, nullptr, true) != kIOReturnSuccess)
+			return false;
+		entry.restorePS0 = false;
+	}
+	return ok;
+}
+
+bool NVMeFixPlugin::PM::registerPowerStates(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl) {
 	unsigned op {};
 	
 	for (int state = ctrl->npss; state >= 0; state--)
@@ -120,26 +157,11 @@ bool NVMeFixPlugin::PM::initActivePM(ControllerEntry& entry, const NVMe::nvme_id
 	auto status = entry.pm->registerPowerDriver(entry.pm, entry.powerStates, entry.nstates);
 	if (status != kIOReturnSuccess) {
 		SYSLOG(Log::PM, "registerPowerDriver failed with 0x%x", status);
-		goto fail;
-	}
-
-	status = entry.pm->makeUsable();
-	if (status != kIOReturnSuccess) {
-		SYSLOG(Log::PM, "makeUsable failed with 0x%x", status);
-		goto fail;
-	}
-
-	entry.pm->changePowerStateTo(1); /* Clamp lowest PS at 1 */
-	entry.pm->setIdleTimerPeriod(idlePeriod);
-
-	return true;
-fail:
-	if (entry.powerStates) {
 		delete[] entry.powerStates;
 		entry.powerStates = nullptr;
+		return false;
 	}
-	/* Do not release PM IOService -- we need it for tracking controller power state change */
-	return false;
+	return true;
 }
 
 OSDefineMetaClassAndStructors(NVMePMProxy, IOService);
@@ -160,7 +182,7 @@ IOReturn NVMePMProxy::setPowerState(unsigned long powerStateOrdinal, IOService *
 
 	/* It's ok to skip active PM */
 	if (IOLockTryLock(entry->lck)) {
-		if (entry->removed || !entry->powerStates || powerStateOrdinal >= entry->nstates) {
+		if (!entry->activePM || powerStateOrdinal >= entry->nstates) {
 			IOLockUnlock(entry->lck);
 			return kIOPMAckImplied;
 		}
@@ -175,13 +197,15 @@ IOReturn NVMePMProxy::setPowerState(unsigned long powerStateOrdinal, IOService *
 
 		if (ret != kIOReturnSuccess) {
 			SYSLOG(Log::PM, "Failed to get power state");
-		} else if (ctrl && res <= ctrl->npss && !(ctrl->psd[res].flags & NVMe::NVME_PS_FLAGS_NON_OP_STATE)) {
+		} else if (res != dword11 && ctrl && res <= ctrl->npss && !(ctrl->psd[res].flags & NVMe::NVME_PS_FLAGS_NON_OP_STATE)) {
 			DBGLOG(Log::PM, "Setting power state 0x%x", dword11);
 
 			ret = plugin.NVMeFeatures(*entry, NVMe::NVME_FEAT_POWER_MGMT, &dword11, nullptr, nullptr,
 										   true);
 			if (ret != kIOReturnSuccess)
 				SYSLOG(Log::PM, "Failed to set power state");
+			else
+				entry->restorePS0 = dword11 != 0;
 		}
 
 		IOLockUnlock(entry->lck);
@@ -222,8 +246,9 @@ IOReturn NVMePMProxy::powerStateDidChangeTo(IOPMPowerFlags capabilities, unsigne
 	if (!identify) {
 		DBGLOG(Log::PM, "Failed to get identify bytes");
 		goto done;
-	} else
-		plugin.enableAPST(*entry, identify);
+	} else if (!plugin.PM.updatePolicy(*entry, identify, plugin.applyAPST(*entry, identify))) {
+		SYSLOG(Log::PM, "Failed to restore power policy");
+	}
 
 done:
 	IOLockUnlock(entry->lck);
@@ -243,21 +268,18 @@ bool NVMeFixPlugin::PM::solveSymbols(KernelPatcher& kp) {
 bool NVMeFixPlugin::PM::activityTickle(void* controller, unsigned long type, unsigned long stateNumber) {
 	auto& plugin = NVMeFixPlugin::globalPlugin();
 
-	ControllerEntry* entry {nullptr};
-	IOLockLock(plugin.lck);
-	entry = plugin.entryForController(static_cast<IOService*>(controller));
-	if (entry && (!entry->processed || !IOLockTryLock(entry->lck)))
-		entry = nullptr;
-	IOLockUnlock(plugin.lck);
-	
-	/* If APST is enabled, we do not manage NVMe PM ourselves. */
-	/* We cannot avoid hooking activityTickle, however, as don't know if we have APST in advance */
-	if (entry) {
-		if (!entry->apste && entry->powerStates && entry->pm) {
-//			DBGLOG("pm", "activityTickle");
-			entry->pm->activityTickle(kIOPMSuperclassPolicy1, entry->nstates - 1);
+	if (atomic_load_explicit(&plugin.activePMControllers, memory_order_acquire) != 0) {
+		IOLockLock(plugin.lck);
+		auto entry = plugin.entryForController(static_cast<IOService*>(controller));
+		if (entry && (!entry->processed || !IOLockTryLock(entry->lck)))
+			entry = nullptr;
+		IOLockUnlock(plugin.lck);
+
+		if (entry) {
+			if (entry->activePM)
+				entry->pm->activityTickle(kIOPMSuperclassPolicy1, entry->nstates - 1);
+			IOLockUnlock(entry->lck);
 		}
-		IOLockUnlock(entry->lck);
 	}
 
 	return plugin.kextFuncs.IONVMeController.activityTickle(controller, type, stateNumber);

@@ -302,10 +302,8 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	DBGLOG(Log::Plugin, "Identified model %s (vid 0x%x)", mn, ctrl->vid);
 #endif
 
-	if (!enableAPST(entry, ctrl) && entry.apstAllowed())
-		SYSLOG(Log::APST, "Failed to enable APST");
-
-	if (!PM.init(entry, ctrl, entry.apste && entry.apstAllowed()))
+	auto state = applyAPST(entry, ctrl);
+	if (!PM.init(entry, ctrl, state))
 		SYSLOG(Log::PM, "Failed to initialise power management");
 }
 
@@ -449,6 +447,7 @@ bool NVMeFixPlugin::terminatedNotificationHandler(void* that, void* , IOService*
 		// Drain setup or a tickle that acquired the entry before removal.
 		IOLockLock(entry->lck);
 		entry->removed = true;
+		plugin->setActivePM(*entry, false);
 		auto pm = entry->pm;
 		IOLockUnlock(entry->lck);
 		if (pm) {
